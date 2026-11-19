@@ -155,11 +155,91 @@ captioned_table <- function(df,
     )
 }
 
-make_params_table <- function(name, pattern = NULL, remove_pattern = FALSE) {
-    sub <- params_table
-    if (!is.null(pattern))   sub <- sub[grep(pattern, sub$Parameter), ]
-    if (remove_pattern)      sub$Parameter <- sub(pattern, "", sub$Parameter)
-    print(captioned_table(sub, caption = paste("Parameters used for", name)))
+# ---- Section: parameter tables ---------------------------------------------
+
+# Build dataframe from nextflow_schema.yaml
+load_param_schema <- function(path) {
+    empty <- data.frame(Parameter = character(), Description = character(), Default = character())
+    if (!file.exists(path)) return(empty)
+    schema <- jsonlite::fromJSON(path, simplifyVector = FALSE)
+    props  <- unlist(map(schema[["$defs"]], "properties"), recursive = FALSE)
+    names(props) <- sub("^[^.]*\\.", "", names(props))
+    if (!length(props)) return(empty)
+
+    schema_default <- function(prop) {
+        # Some defaults only exist inside anyOf, e.g. filtering_min_abundance
+        default <- prop$default
+        if (is.null(default)) {
+            default <- detect(prop$anyOf, \(x) !is.null(x$default))$default
+        }
+        if (is.null(default)) return(NA_character_)
+        default <- unlist(default)
+        if (is.logical(default)) tolower(as.character(default)) else paste(default, collapse = ",")
+    }
+
+    data.frame(
+        Parameter   = names(props),
+        Description = map_chr(props, \(x) x$description %||% NA_character_),
+        Default     = map_chr(props, schema_default),
+        row.names   = NULL
+    )
+}
+
+# Check if default value was employed
+is_default_value <- function(value, default) {
+    value   <- tolower(value)
+    default <- tolower(default)
+    if_else(
+        grepl("${projectdir}", default, fixed = TRUE),
+        basename(value) == basename(default),
+        value == default
+    )
+}
+
+build_param_info <- function(params_table, schema_info) {
+    params_table |>
+        left_join(schema_info, by = "Parameter") |>
+        mutate(
+            Value  = if_else(Value %in% c("TRUE", "FALSE"), tolower(Value), Value),
+            Status = case_when(
+                is.na(Default)                   ~ "set",
+                is_default_value(Value, Default) ~ "default",
+                TRUE                             ~ "changed"
+            )
+        ) |>
+        select(Parameter, Value, Default, Description, Status)
+}
+
+# create table from dataframe
+params_reactable <- function(pattern = NULL, caption = NULL, searchable = FALSE, height = NULL) {
+    df <- param_info
+    if (!is.null(pattern)) df <- df[grepl(pattern, df$Parameter), , drop = FALSE]
+    if (nrow(df) == 0) return(invisible())
+    df <- df[order(df$Status != "changed"), , drop = FALSE]
+    if (all(is.na(df$Default)))     df$Default     <- NULL
+    if (all(is.na(df$Description))) df$Description <- NULL
+    if (is.null(height) && nrow(df) > 10) height <- 320
+
+    wrap_anywhere <- list(overflowWrap = "anywhere")
+    columns <- list(
+        Parameter   = reactable::colDef(minWidth = 200),
+        Value       = reactable::colDef(minWidth = 140, style = wrap_anywhere),
+        Default     = reactable::colDef(minWidth = 110, style = wrap_anywhere, na = ""),
+        Description = reactable::colDef(minWidth = 320, na = ""),
+        Status      = reactable::colDef(show = FALSE)
+    )
+
+    print(captioned_table(
+        df,
+        caption    = caption,
+        pagination = FALSE,
+        sortable   = FALSE,
+        searchable = searchable,
+        columns    = columns[intersect(names(columns), colnames(df))],
+        compact    = TRUE,
+        height     = height,
+        rowStyle   = \(i) if (df$Status[i] == "changed") list(background = "rgba(36, 176, 100, 0.12)")
+    ))
 }
 
 
@@ -257,6 +337,57 @@ name_contrast <- function(row) {
 }
 
 
+# ---- Section: abundance matrix descriptions --------------------------------
+
+describe_assay <- function(assay_type, log2) {
+    low_count_filter <- if (isFALSE(p$filtering_min_abundance)) "" else paste0(
+        "removing ", p$features_type, "s with low counts (minimal abundance: ", p$filtering_min_abundance, ") and "
+    )
+    log2_note <- if (log2) " The data was log2-transformed for plotting." else ""
+    switch(
+        assay_type,
+        "raw" = paste0(
+            switch(
+                p$study_type,
+                "affy_array" = "Array intensities summarised with `justRMA`, without normalisation",
+                "maxquant"   = "Protein intensities from MaxQuant, before normalisation",
+                "The input matrix"
+            ),
+            if (log2) " after a log2 transformation. Abundance values of zero were replaced by one before the transformation." else "."
+        ),
+        "normalised" = paste0(
+            switch(
+                p$study_type,
+                "affy_array"    = "Array intensities summarised with `justRMA`, with quantile normalisation.",
+                "maxquant"      = paste0("Protein intensities after normalisation with `proteus` (", p$proteus_norm_function, ")."),
+                "geo_soft_file" = "Normalised values as provided in the GEO SOFT file.",
+                switch(
+                    p$differential_method,
+                    "deseq2" = paste0("Counts after ", low_count_filter, "adjusting for differences in sequencing depth."),
+                    "limma"  = paste0("Counts after ", low_count_filter, "converting to log2 counts per million with `voom`."),
+                    "dream"  = paste0("Counts after ", low_count_filter, "converting to log2 counts per million with `voomWithDreamWeights`."),
+                    paste0("Counts after ", low_count_filter, "normalisation.")
+                )
+            ),
+            log2_note
+        ),
+        "variance_stabilised" = paste0(
+            "Normalised counts transformed with DESeq2 (", p$deseq2_vs_method,
+            "), accounting for the dependence of the variance on the mean."
+        ),
+        paste0("Values as provided.", log2_note)
+    )
+}
+
+render_assay_descriptions <- function() {
+    log2_names <- if (is.null(log2_assays)) character(0) else simple_split(log2_assays)
+    cat("\nThe following plots show the distribution of abundance values in each ", p$observations_type, ". Each panel shows one version of the data:\n\n", sep = "")
+    for (assay_type in names(assay_data)) {
+        cat("- ", prettify_variable_name(assay_type), ": ", describe_assay(assay_type, assay_type %in% log2_names), "\n", sep = "")
+    }
+}
+
+
 # ---- Section: filtering summary --------------------------------------------
 
 render_filtering_summary <- function() {
@@ -304,7 +435,7 @@ render_filtering_summary <- function() {
     summary_tbl <- tibble(
         Metric  = c("Total features", "Retained after filtering", "Removed by filtering"),
         Count   = c(total_features, retained, removed),
-        Percent = c(100, 100 * retained / total_features, 100 * removed / total_features)
+        Percent = round(c(100, 100 * retained / total_features, 100 * removed / total_features),4)
     )
     print(captioned_table(summary_tbl, caption = "Filtering summary"))
     cat("\n")
@@ -737,7 +868,7 @@ render_biotype_plot <- function(combined) {
 render_de_details <- function(i) {
     if (i == 1 && length(warnings_list) > 0) walk(warnings_list, cat)
 
-    cat("\n#### ", contrast_descriptions[i], "\n")
+    cat("\n#### ", contrast_descriptions[i], " {.contrast-heading}\n")
     cat('::: {.panel-tabset style="width: 1000px; min-width: 1000px;"}\n\n')
 
     full_de <- differential_results[[i]]
@@ -907,6 +1038,15 @@ params_table <- data.frame(
     Value     = unlist(params),
     row.names = NULL
 )
+param_info <- build_param_info(
+    params_table,
+    load_param_schema(file.path(params$input_dir, "nextflow_schema.json"))
+)
+has_param_defaults <- any(param_info$Status != "set")
+
+workflow_version <- versions[["Workflow.nf-core/differentialabundance"]]
+docs_version     <- if (grepl("dev", workflow_version)) "dev" else sub("^v", "", workflow_version)
+params_docs_url  <- paste0("https://nf-co.re/differentialabundance/", docs_version, "/parameters")
 
 report_title <- paste0(
     "Differential ", p$features_type, " abundance report",
@@ -1241,7 +1381,9 @@ render_filtering_summary()
 
 ### Abundance value distributions
 
-The following plots show the abundance value distributions of input matrices. A log2 transformation is applied where not already performed.
+```{r assay-descriptions, echo=FALSE, results='asis'}
+render_assay_descriptions()
+```
 
 #### Box plots
 
@@ -1366,16 +1508,23 @@ if (!is.null(p$functional_method)) {
 
 # Methods
 
+```{r methods-intro, echo=FALSE, results='asis'}
+cat(
+    "Each tab lists the parameters of one analysis step.",
+    if (has_param_defaults) " Rows highlighted in green differ from the pipeline defaults." else "",
+    " The [parameter documentation](", params_docs_url, ") describes every parameter in detail.\n",
+    sep = ""
+)
+```
+
+::: {.panel-tabset}
+
 ```{r maxquant-import-params, echo=FALSE, results='asis', eval=p$study_type == 'maxquant'}
-cat(paste0("\n## Protein abundance import\n"))
-make_params_table("importing maxquant output", "proteus_", remove_pattern = TRUE)
+cat("\n## Protein abundance import\n\n")
+params_reactable("^proteus_", caption = "Parameters used for importing MaxQuant output")
 ```
 
 ## Filtering
-
-```{r filtering-params, echo=FALSE, results='asis'}
-make_params_table("feature-wise filtering", "filtering_", remove_pattern = TRUE)
-```
 
 ```{r filtering-description, echo=FALSE, results='asis'}
 filtering_string <- paste0(
@@ -1400,40 +1549,50 @@ if (is.null(p$filtering_grouping_var)) {
                                    p$filtering_grouping_var, '".')
     }
 }
-cat(filtering_string)
+cat(filtering_string, "\n\n")
+```
+
+```{r filtering-params, echo=FALSE, results='asis'}
+params_reactable("^filtering_", caption = "Parameters used for feature-wise filtering")
 ```
 
 ## Exploratory analysis
 
 ```{r exploratory-params, echo=FALSE, results='asis'}
-make_params_table("exploratory analysis", "exploratory_", remove_pattern = TRUE)
+params_reactable("^exploratory_", caption = "Parameters used for exploratory analysis")
 ```
 
 ## Differential analysis
 
 ```{r diff-params, echo=FALSE, results='asis'}
-if (p$differential_method == "deseq2") {
-    make_params_table("DESeq2", "deseq2_", remove_pattern = TRUE)
-}
-make_params_table("downstream differential analysis", "differential_", remove_pattern = TRUE)
+params_reactable(
+    paste0("^(differential_|", p$differential_method, "_)"),
+    caption = paste0("Parameters used for differential analysis (", p$differential_method, ")")
+)
 ```
 
-```{r gene-set-params, echo=FALSE, results='asis'}
-if (!is.null(p$functional_method)) {
-    cat("\n### Gene set analysis\n")
-    cat("\n#### ", toupper(p$functional_method), "\n")
-    make_params_table(toupper(p$functional_method),
-                      paste0(p$functional_method, "_"),
-                      remove_pattern = TRUE)
-}
+```{r functional-params, echo=FALSE, results='asis', eval=!is.null(p$functional_method) && p$functional_method != "none"}
+cat("\n## Functional analysis\n\n")
+params_reactable(
+    paste0("^(functional_method|gene_sets_files)$|^", p$functional_method, "_"),
+    caption = paste0("Parameters used for functional analysis (", p$functional_method, ")")
+)
 ```
+
+:::
 
 # Appendices
+
+::: {.panel-tabset}
 
 ## All parameters
 
 ```{r all-params, echo=FALSE, results='asis'}
-captioned_table(params_table)
+params_reactable(
+    caption    = "All parameters used for this report",
+    searchable = TRUE,
+    height     = 450
+)
 ```
 
 ## Software versions
@@ -1448,10 +1607,23 @@ versions_table <- data.frame(
 colnames(versions_table) <- c("Component", "Software", "Version")
 rownames(versions_table) <- NULL
 
-captioned_table(versions_table, caption = "Software versions")
+print(captioned_table(
+    versions_table,
+    caption    = "Software versions",
+    pagination = FALSE,
+    compact    = TRUE,
+    height     = if (nrow(versions_table) > 10) 320 else NULL
+))
 ```
 
+## Citations
+
 ```{r citations, echo=FALSE, results='asis'}
+# Drop the file's title and push its headings below the TOC depth
 citations_md <- readLines(params$citations)
+citations_md <- citations_md[!grepl("^# ", citations_md)]
+citations_md <- sub("^## ", "##### ", citations_md)
 cat(citations_md, sep = "\n")
 ```
+
+:::
